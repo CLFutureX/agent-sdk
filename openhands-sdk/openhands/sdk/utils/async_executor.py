@@ -3,8 +3,8 @@
 import asyncio
 import inspect
 import threading
-from collections.abc import Callable
 import time
+from collections.abc import Callable
 from typing import Any
 
 from openhands.sdk.logger import get_logger
@@ -31,14 +31,14 @@ class AsyncExecutor:
         """Ensure the background event loop is running."""
         with self._lock:
             if self._shutdown.is_set():
-                raise RuntimeError("asyncExecutor has been shut down")
+                raise RuntimeError("AsyncExecutor has been shut down")
 
             if self._loop is not None:
                 if self._loop.is_running():
                     return callback(self._loop)
 
-                logger.warning("The loop is not empty, but it is not in a running state." \
-                " Under normal circumstances, this should not happen.")
+                logger.warning("The loop is not empty, but it is not in a running state. "
+                "Under normal circumstances, this should not happen.")
                 self._loop.close()
 
             loop = asyncio.new_event_loop()
