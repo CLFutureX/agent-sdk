@@ -1,6 +1,7 @@
 """Reusable async-to-sync execution utility."""
 
 import asyncio
+import concurrent.futures
 import inspect
 import threading
 import time
@@ -110,7 +111,7 @@ class AsyncExecutor:
             coro = awaitable_or_fn(*args, **kwargs)
         else:
             raise TypeError("run_async expects a coroutine or async function")
-        def submit_task(loop: asyncio.AbstractEventLoop) -> Any:
+        def submit_task(loop: asyncio.AbstractEventLoop) -> concurrent.futures.Future[Any]:
             return asyncio.run_coroutine_threadsafe(coro, loop)
 
         fut = self._safe_execute_on_loop(submit_task)
