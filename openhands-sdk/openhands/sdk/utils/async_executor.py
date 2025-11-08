@@ -27,17 +27,16 @@ class AsyncExecutor:
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
 
-    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+    def _safe_execute_on_loop(self, callback: Callable[[asyncio.AbstractEventLoop], Any]) -> Any:
         """Ensure the background event loop is running."""
-        if self._loop is not None and self._loop.is_running():
-            return self._loop
         with self._lock:
             if self._shutdown.is_set():
                 raise RuntimeError("asyncExecutor has been shut down")
 
             if self._loop is not None:
                 if self._loop.is_running():
-                    return self._loop
+                    return callback(self._loop)
+
                 logger.warning("The loop is not empty, but it is not in a running state." \
                 " Under normal circumstances, this should not happen.")
                 self._loop.close()
@@ -57,7 +56,7 @@ class AsyncExecutor:
 
             self._loop = loop
             self._thread = t
-            return loop
+            return callback(self._loop)
 
     def _shutdown_loop(self) -> None:
         """Shutdown the background event loop."""
@@ -111,9 +110,10 @@ class AsyncExecutor:
             coro = awaitable_or_fn(*args, **kwargs)
         else:
             raise TypeError("run_async expects a coroutine or async function")
+        def submit_task(loop: asyncio.AbstractEventLoop) -> Any:
+            return asyncio.run_coroutine_threadsafe(coro, loop)
 
-        loop = self._ensure_loop()
-        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        fut = self._safe_execute_on_loop(submit_task)
         return fut.result(timeout)
 
     def close(self):
