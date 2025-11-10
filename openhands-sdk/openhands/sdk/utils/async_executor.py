@@ -40,7 +40,10 @@ class AsyncExecutor:
 
                 logger.warning("The loop is not empty, but it is not in a running state. "
                 "Under normal circumstances, this should not happen.")
-                self._loop.close()
+                try:
+                    self._loop.close()
+                except RuntimeError as e:
+                    logger.warning(f"Failed to close inactive loop: {e}")
 
             loop = asyncio.new_event_loop()
 
@@ -79,6 +82,12 @@ class AsyncExecutor:
             t.join(timeout=1.0)
             if t.is_alive():
                 logger.warning("AsyncExecutor thread did not terminate gracefully")
+
+        if loop and not loop.is_closed():
+            try:
+                loop.close()
+            except RuntimeError as e:
+                logger.warning(f"Failed to close event loop: {e}")
 
     def run_async(
         self,
