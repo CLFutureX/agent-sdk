@@ -5,8 +5,8 @@ import concurrent.futures
 import inspect
 import threading
 import time
+from typing import Any, Coroutine
 from collections.abc import Callable
-from typing import Any
 
 from openhands.sdk.logger import get_logger
 
@@ -28,9 +28,9 @@ class AsyncExecutor:
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
 
-    def _safe_execute_on_loop(
-            self, callback: Callable[[asyncio.AbstractEventLoop], Any]
-        ) -> Any:
+    def _safe_submit_on_loop(
+            self, coro: Coroutine
+        ) -> concurrent.futures.Future:
         """Ensure the background event loop is running."""
         with self._lock:
             if self._shutdown.is_set():
@@ -38,7 +38,7 @@ class AsyncExecutor:
 
             if self._loop is not None:
                 if self._loop.is_running():
-                    return callback(self._loop)
+                    return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
                 logger.warning(
                     "The loop is not empty, but it is not in a running state. "
@@ -64,12 +64,12 @@ class AsyncExecutor:
 
             self._loop = loop
             self._thread = t
-            return callback(self._loop)
+            return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def _shutdown_loop(self) -> None:
         """Shutdown the background event loop."""
         if self._shutdown.is_set():
-            logger.info("AsyncExecutor has been shutdown")
+            logger.info("AsyncExecutor has been shut down")
             return
 
         with self._lock:
@@ -133,12 +133,8 @@ class AsyncExecutor:
             coro = awaitable_or_fn(*args, **kwargs)
         else:
             raise TypeError("run_async expects a coroutine or async function")
-        def submit_task(
-                loop: asyncio.AbstractEventLoop
-        ) -> concurrent.futures.Future[Any]:
-            return asyncio.run_coroutine_threadsafe(coro, loop)
 
-        fut = self._safe_execute_on_loop(submit_task)
+        fut = self._safe_submit_on_loop(coro)
 
         try:
             return fut.result(timeout)
