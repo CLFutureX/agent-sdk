@@ -5,12 +5,14 @@ import concurrent.futures
 import inspect
 import threading
 import time
-from typing import Any, Coroutine
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 from openhands.sdk.logger import get_logger
 
+
 logger = get_logger(__name__)
+
 
 class AsyncExecutor:
     """
@@ -28,9 +30,7 @@ class AsyncExecutor:
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
 
-    def _safe_submit_on_loop(
-            self, coro: Coroutine
-        ) -> concurrent.futures.Future:
+    def _safe_submit_on_loop(self, coro: Coroutine) -> concurrent.futures.Future:
         """Ensure the background event loop is running."""
         with self._lock:
             if self._shutdown.is_set():
@@ -42,7 +42,7 @@ class AsyncExecutor:
 
                 logger.warning(
                     "The loop is not empty, but it is not in a running state. "
-                "Under normal circumstances, this should not happen."
+                    "Under normal circumstances, this should not happen."
                 )
                 try:
                     self._loop.close()
@@ -138,7 +138,7 @@ class AsyncExecutor:
 
         try:
             return fut.result(timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             fut.cancel()
             raise
         except concurrent.futures.CancelledError:
