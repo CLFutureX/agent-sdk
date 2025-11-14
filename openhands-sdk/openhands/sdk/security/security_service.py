@@ -1,15 +1,20 @@
-from openhands.sdk.conversation.state import ConversationState
 from openhands.sdk.event.llm_convertible.action import ActionEvent
 from openhands.sdk.security import risk
+from openhands.sdk.security.analyzer import SecurityAnalyzerBase
+from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
 from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
 from openhands.sdk.tool.builtins.finish import FinishAction
 from openhands.sdk.tool.builtins.think import ThinkAction
 
 
 class SecurityService:
-    def __init__(self, state: ConversationState):
-        self._confirmation_policy = state.confirmation_policy
-        self._security_analyzer = state.security_analyzer
+    def __init__(
+        self,
+        confirmation_policy: ConfirmationPolicyBase,
+        security_analyzer: SecurityAnalyzerBase | None = None,
+    ):
+        self._confirmation_policy = confirmation_policy
+        self._security_analyzer = security_analyzer
 
     def requires_confirmation(
         self,
