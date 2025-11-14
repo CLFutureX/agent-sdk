@@ -4,6 +4,8 @@ This module tests the _extract_security_risk method which handles extraction
 and validation of security risk parameters from tool arguments.
 """
 
+import uuid
+
 import pytest
 from pydantic import SecretStr
 
@@ -16,6 +18,7 @@ from openhands.sdk.security.analyzer import SecurityAnalyzerBase
 from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
 from openhands.sdk.security.risk import SecurityRisk
 from openhands.sdk.security.security_service import SecurityService
+from openhands.sdk.workspace.local import LocalWorkspace
 
 
 class MockNonLLMAnalyzer(SecurityAnalyzerBase):
@@ -48,6 +51,13 @@ class MockSecurityServiceAgent(Agent):
             except Exception:
                 pass
         self._security_service = SecurityService(state)
+
+
+def init_agent(agent: Agent):
+    state = ConversationState.create(
+        id=uuid.uuid4(), agent=agent, workspace=LocalWorkspace(working_dir="/tmp")
+    )
+    agent.init_state(state, lambda e: None)
 
 
 @pytest.fixture
@@ -120,6 +130,7 @@ def test_extract_security_risk(
     """Test _extract_security_risk method with various scenarios."""
     # Get the agent fixture
     agent = request.getfixturevalue(agent_fixture)
+    init_agent(agent)
 
     # Prepare arguments
     arguments = {"some_param": "value"}
@@ -153,6 +164,7 @@ def test_extract_security_risk_arguments_mutation():
             base_url="http://test",
         )
     )
+    init_agent(agent)
 
     # Test with security_risk present
     arguments = {"param1": "value1", "security_risk": "LOW", "param2": "value2"}
@@ -184,6 +196,7 @@ def test_extract_security_risk_with_empty_arguments():
             base_url="http://test",
         )
     )
+    init_agent(agent)
 
     arguments = {}
     result = agent._security_service.extract_security_risk(
@@ -206,6 +219,7 @@ def test_extract_security_risk_with_read_only_tool():
         ),
         security_analyzer=LLMSecurityAnalyzer(),
     )
+    init_agent(agent)
 
     # Test with readOnlyHint=True - should return UNKNOWN regardless of security_risk
     arguments = {"param1": "value1", "security_risk": "HIGH"}
