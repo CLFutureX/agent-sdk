@@ -9,7 +9,7 @@ from openhands.sdk.tool.builtins.think import ThinkAction
 class SecurityService:
     def __init__(
         self,
-        state: ConversationState,
+        state: "ConversationState",
     ):
         self._state = state
 
