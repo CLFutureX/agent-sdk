@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pathlib
 from collections.abc import Mapping
 
@@ -281,12 +282,13 @@ class AgentContext(BaseModel):
                     skill.name,
                     trigger,
                 )
+                location = os.path.dirname(skill.source) if skill.source else None
                 recalled_knowledge.append(
                     SkillKnowledge(
                         name=skill.name,
                         trigger=trigger,
                         content=skill.content,
-                        location=skill.source,
+                        location=location,
                     )
                 )
         if recalled_knowledge:
