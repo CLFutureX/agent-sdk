@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -13,6 +14,11 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SecretStr,
+    SerializationInfo,
+    ValidationInfo,
+    model_serializer,
+    model_validator,
 )
 
 from openhands.sdk.context.agent_context import AgentContext
@@ -30,7 +36,8 @@ from openhands.sdk.tool import (
     ToolDefinition,
     resolve_tool,
 )
-from openhands.sdk.utils.models import DiscriminatedUnionMixin
+from openhands.sdk.tool.builtins import InvokeSkillTool
+from openhands.sdk.utils.models import DiscriminatedUnionMixin, get_handler_class_name
 
 
 if TYPE_CHECKING:
@@ -39,6 +46,7 @@ if TYPE_CHECKING:
         ConversationCallbackType,
         ConversationTokenCallbackType,
     )
+    from openhands.sdk.utils.cipher import Cipher
 
 logger = get_logger(__name__)
 
@@ -135,6 +143,19 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
             }
         ],
     )
+    system_prompt: str | None = Field(
+        default=None,
+        description=(
+            "Inline system prompt string.  When provided, the agent uses this "
+            "text verbatim as the system message instead of rendering from "
+            "`system_prompt_filename`.  Mutually exclusive with a non-default "
+            "`system_prompt_filename`.\n\n"
+            "**Warning**: This is not recommended unless you know what you are "
+            "doing (e.g. customising agent behaviour for a completely different "
+            "task).  Setting this will override OpenHands' built-in system "
+            "instructions that govern default agent behaviour."
+        ),
+    )
     system_prompt_filename: str = Field(
         default="system_prompt.j2",
         description=(
@@ -150,7 +171,8 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
             "Security policy template filename. Can be either:\n"
             "- A relative filename (e.g., 'security_policy.j2') loaded from the "
             "agent's prompts directory\n"
-            "- An absolute path (e.g., '/path/to/custom_security_policy.j2')"
+            "- An absolute path (e.g., '/path/to/custom_security_policy.j2')\n"
+            "- Empty string to disable security policy"
         ),
     )
     system_prompt_kwargs: dict[str, object] = Field(
@@ -158,6 +180,133 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         description="Optional kwargs to pass to the system prompt Jinja2 template.",
         examples=[{"cli_mode": True}],
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_system_prompt_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if (
+            "security_policy_filename" in data
+            and data["security_policy_filename"] is None
+        ):
+            data["security_policy_filename"] = ""
+        has_inline = data.get("system_prompt") is not None
+        has_custom_filename = (
+            "system_prompt_filename" in data
+            and data["system_prompt_filename"] != "system_prompt.j2"
+        )
+        if has_inline and has_custom_filename:
+            raise ValueError(
+                "Cannot set both 'system_prompt' and a non-default "
+                "'system_prompt_filename'. Use one or the other."
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _decrypt_mcp_config(cls, data: Any, info: ValidationInfo) -> Any:
+        """Decrypt encrypted_mcp_config if present and cipher is in context.
+
+        Handles backward compatibility:
+        - If encrypted_mcp_config exists and cipher is present: decrypt and
+          set mcp_config
+        - If mcp_config exists directly: use it as-is (plaintext or
+          expose_secrets case)
+        - If neither exists: default empty dict will be used
+        """
+        if not isinstance(data, dict):
+            return data
+        # - Empty config: omit (default value, nothing to protect)
+        encrypted = data.pop("encrypted_mcp_config", None)
+        if encrypted is None:
+            return data
+
+        # If no cipher in context, we can't decrypt - the encrypted value is lost
+        if not info.context or not info.context.get("cipher"):
+            logger.warning(
+                "Found encrypted_mcp_config but no cipher in context - "
+                "MCP configuration will be lost. Provide a cipher to preserve it."
+            )
+            return data
+
+        cipher: Cipher = info.context["cipher"]
+        decrypted = cipher.decrypt(encrypted)
+        if decrypted is None:
+            logger.warning(
+                "Failed to decrypt mcp_config (cipher mismatch or corruption) - "
+                "MCP configuration will be lost."
+            )
+            return data
+
+        try:
+            data["mcp_config"] = json.loads(decrypted.get_secret_value())
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse decrypted mcp_config as JSON: {e}")
+
+        return data
+
+    @model_serializer(mode="wrap")
+    def _serialize_with_mcp_handling(self, handler, info: SerializationInfo):
+        """Serialize the agent, handling mcp_config encryption/redaction.
+
+        This serializer handles:
+        1. Polymorphic serialization for subclasses (e.g., ACPAgent)
+        2. mcp_config encryption when cipher is in context
+        3. mcp_config redaction (omission) when neither cipher nor expose_secrets
+
+        The mcp_config handling is done here (not in a field_serializer) to avoid
+        changing the field's schema type, which would break REST API compatibility.
+        """
+        if isinstance(self, dict):
+            # Sometimes pydantic passes a dict in here.
+            return self
+
+        # Check if handler is for the current (actual) class
+        # See get_handler_class_name() for details on the fragile string parsing
+        handler_class = get_handler_class_name(handler)
+
+        if handler_class != self.__class__.__name__:
+            # Handler is for a base class, delegate to model_dump for proper
+            # subclass serialization (e.g., ACPAgent fields)
+            result = self.model_dump(
+                mode=info.mode,
+                context=info.context,
+                by_alias=info.by_alias,
+                exclude_unset=info.exclude_unset,
+                exclude_defaults=info.exclude_defaults,
+                exclude_none=info.exclude_none,
+                round_trip=info.round_trip,
+                serialize_as_any=info.serialize_as_any,
+            )
+        else:
+            result = handler(self)
+
+        # Handle mcp_config based on context:
+        # - Empty config: omit (nothing sensitive)
+        # - expose_secrets=True: keep as-is (explicitly requested)
+        # - cipher present: encrypt and store in encrypted_mcp_config, omit original
+        # - default: omit (redact sensitive data)
+        if not self.mcp_config:  # Only process non-empty configs
+            result.pop("mcp_config", None)
+            return result
+        elif info.context and info.context.get("cipher"):
+            # Encrypt and add encrypted_mcp_config
+            cipher: Cipher = info.context["cipher"]
+            json_str = json.dumps(self.mcp_config)
+            encrypted = cipher.encrypt(SecretStr(json_str))
+            if encrypted:
+                result["encrypted_mcp_config"] = encrypted
+            # Remove plaintext mcp_config
+            result.pop("mcp_config", None)
+            return result
+        elif info.context and info.context.get("expose_secrets"):
+            # Keep mcp_config as-is (already in result from handler)
+            return result
+        else:
+            # Default: redact by omitting
+            result.pop("mcp_config", None)
+            return result
 
     condenser: CondenserBase | None = Field(
         default=None,
@@ -186,6 +335,17 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         examples=[{"kind": "AgentFinishedCritic"}],
     )
 
+    tool_concurrency_limit: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Maximum number of tool calls to execute concurrently within a single "
+            "agent step. Default is 1 (sequential). Values > 1 enable parallel "
+            "execution; concurrent tools share the conversation object, filesystem, "
+            "and working directory, so mutations to shared state may race."
+        ),
+    )
+
     # Runtime materialized tools; private and non-serializable
     _tools: dict[str, ToolDefinition] = PrivateAttr(default_factory=dict)
     _initialized: bool = PrivateAttr(default=False)
@@ -205,9 +365,28 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         return self.__class__.__name__
 
     @property
-    def system_message(self) -> str:
-        """Compute system message on-demand to maintain statelessness."""
+    def static_system_message(self) -> str:
+        """Compute the static portion of the system message.
+
+        This returns only the base system prompt template without any dynamic
+        per-conversation context. This static portion can be cached and reused
+        across conversations for better prompt caching efficiency.
+
+        When ``system_prompt`` is set, that string is returned verbatim,
+        bypassing Jinja2 template rendering entirely.
+
+        Returns:
+            The rendered system prompt template without dynamic context.
+        """
+        if self.system_prompt is not None:
+            return self.system_prompt
+
         template_kwargs = dict(self.system_prompt_kwargs)
+        # Auto-detect browser tools from the tool spec list
+        template_kwargs.setdefault(
+            "enable_browser",
+            any(t.name == "browser_tool_set" for t in self.tools),
+        )
         # Add security_policy_filename to template kwargs
         template_kwargs["security_policy_filename"] = self.security_policy_filename
         template_kwargs.setdefault("model_name", self.llm.model)
@@ -222,19 +401,35 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
                 template_kwargs["model_family"] = spec.family
             if "model_variant" not in template_kwargs and spec.variant:
                 template_kwargs["model_variant"] = spec.variant
-        system_message = render_template(
+        return render_template(
             prompt_dir=self.prompt_dir,
             template_name=self.system_prompt_filename,
             **template_kwargs,
         )
-        if self.agent_context:
-            _system_message_suffix = self.agent_context.get_system_message_suffix(
-                llm_model=self.llm.model,
-                llm_model_canonical=self.llm.model_canonical_name,
-            )
-            if _system_message_suffix:
-                system_message += "\n\n" + _system_message_suffix
-        return system_message
+
+    @property
+    def dynamic_context(self) -> str | None:
+        """Get the dynamic per-conversation context.
+
+        This returns the context that varies between conversations, such as:
+        - Repository information and skills
+        - Runtime information (hosts, working directory)
+        - User-specific secrets and settings
+        - Conversation instructions
+
+        This content should NOT be included in the cached system prompt to enable
+        cross-conversation cache sharing. Instead, it is sent as a second content
+        block (without a cache marker) inside the system message.
+
+        Returns:
+            The dynamic context string, or None if no context is configured.
+        """
+        if not self.agent_context:
+            return None
+        return self.agent_context.get_system_message_suffix(
+            llm_model=self.llm.model,
+            llm_model_canonical=self.llm.model_canonical_name,
+        )
 
     def init_state(
         self,
@@ -291,7 +486,21 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
 
         # Include default tools from include_default_tools; not subject to regex
         # filtering. Use explicit mapping to resolve tool class names.
-        for tool_name in self.include_default_tools:
+        # Auto-attach `InvokeSkillTool` iff an AgentSkills-format skill is
+        # loaded and the user hasn't already opted in explicitly.
+        has_agentskills = bool(
+            self.agent_context
+            and any(s.is_agentskills_format for s in self.agent_context.skills)
+        )
+        default_tool_names = list(self.include_default_tools)
+        if has_agentskills and InvokeSkillTool.__name__ not in default_tool_names:
+            default_tool_names.append(InvokeSkillTool.__name__)
+            logger.debug(
+                "Auto-attached %s (AgentSkills-format skill present in agent_context)",
+                InvokeSkillTool.__name__,
+            )
+
+        for tool_name in default_tool_names:
             tool_class = BUILT_IN_TOOL_CLASSES.get(tool_name)
             if tool_class is None:
                 raise ValueError(
@@ -355,11 +564,11 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
 
         Compatibility requirements:
         - Agent class/type must match.
-        - Tools must match exactly (same tool names).
+        - Tools may only be added, never removed.
 
-        Tools are part of the system prompt and cannot be changed mid-conversation.
-        To use different tools, start a new conversation or use conversation forking
-        (see https://github.com/OpenHands/OpenHands/issues/8560).
+        Removing tools breaks backward compatibility because the LLM may have
+        already been told about them.  Adding new tools is safe — the LLM
+        simply gains new capabilities on the next turn.
 
         All other configuration (LLM, agent_context, condenser, etc.) can be
         freely changed between sessions.
@@ -397,24 +606,18 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
             if tool_class is not None:
                 persisted_names.add(tool_class.name)
 
-        if runtime_names == persisted_names:
-            return self
-
-        # Tools don't match - this is not allowed
+        # Removing tools breaks backward compatibility because the LLM may
+        # have already been told about them.  Adding new tools is safe — the
+        # LLM simply gains new capabilities on the next turn.
         missing_in_runtime = persisted_names - runtime_names
-        added_in_runtime = runtime_names - persisted_names
-
-        details: list[str] = []
         if missing_in_runtime:
-            details.append(f"removed: {sorted(missing_in_runtime)}")
-        if added_in_runtime:
-            details.append(f"added: {sorted(added_in_runtime)}")
+            raise ValueError(
+                f"Cannot resume conversation: tools were removed mid-conversation "
+                f"(removed: {sorted(missing_in_runtime)}). "
+                f"To use different tools, start a new conversation."
+            )
 
-        raise ValueError(
-            f"Cannot resume conversation: tools cannot be changed mid-conversation "
-            f"({'; '.join(details)}). "
-            f"To use different tools, start a new conversation."
-        )
+        return self
 
     def model_dump_succint(self, **kwargs):
         """Like model_dump, but excludes None fields by default."""
@@ -426,7 +629,7 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
             dumped["tools"] = list(dumped["tools"].keys())
         return dumped
 
-    def get_all_llms(self) -> Generator[LLM, None, None]:
+    def get_all_llms(self) -> Generator[LLM]:
         """Recursively yield unique *base-class* LLM objects reachable from `self`.
 
         - Returns actual object references (not copies).
@@ -503,5 +706,23 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
             RuntimeError: If the agent has not been initialized.
         """
         if not self._initialized:
-            raise RuntimeError("Agent not initialized; call initialize() before use")
+            raise RuntimeError("Agent not initialized; call _initialize() before use")
         return self._tools
+
+    def ask_agent(self, question: str) -> str | None:  # noqa: ARG002
+        """Optional override for stateless question answering.
+
+        Subclasses (e.g. ACPAgent) may override this to provide their own
+        implementation of ask_agent that bypasses the default LLM-based path.
+
+        Returns:
+            Response string, or ``None`` to use the default LLM-based approach.
+        """
+        return None
+
+    def close(self) -> None:
+        """Clean up agent resources.
+
+        No-op by default; ACPAgent overrides to terminate subprocess.
+        """
+        pass

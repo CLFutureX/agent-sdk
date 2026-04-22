@@ -7,9 +7,6 @@ import time
 
 from openhands.sdk import get_logger
 from openhands.sdk.conversation import get_agent_final_response
-from openhands.sdk.tool import Tool, register_tool
-from openhands.tools.file_editor import FileEditorTool
-from openhands.tools.terminal import TerminalTool
 from tests.integration.base import BaseIntegrationTest, TestResult
 
 
@@ -101,14 +98,9 @@ class SimpleBrowsingTest(BaseIntegrationTest):
         self.server_process: subprocess.Popen[bytes] | None = None
 
     @property
-    def tools(self) -> list[Tool]:
-        """List of tools available to the agent."""
-        register_tool("TerminalTool", TerminalTool)
-        register_tool("FileEditorTool", FileEditorTool)
-        return [
-            Tool(name="TerminalTool"),
-            Tool(name="FileEditorTool"),
-        ]
+    def enable_browser(self) -> bool:
+        """Enable browser tools for this browsing test."""
+        return True
 
     def setup(self) -> None:
         """Set up a local web server with the HTML file."""
@@ -179,7 +171,7 @@ class SimpleBrowsingTest(BaseIntegrationTest):
             )
 
     def teardown(self):
-        """Turn down the web server"""
+        """Turn down the web server and close the conversation."""
         if self.server_process:
             try:
                 self.server_process.terminate()
@@ -190,3 +182,4 @@ class SimpleBrowsingTest(BaseIntegrationTest):
                 logger.warning(f"Error terminating server process: {e}")
 
         logger.info("Cleaned up web server")
+        super().teardown()

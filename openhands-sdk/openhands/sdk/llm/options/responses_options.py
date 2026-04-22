@@ -15,15 +15,16 @@ def select_responses_options(
 ) -> dict[str, Any]:
     """Behavior-preserving extraction of _normalize_responses_kwargs."""
     # Apply defaults for keys that are not forced by policy
-    out = apply_defaults_if_absent(
-        user_kwargs,
-        {
-            "max_output_tokens": llm.max_output_tokens,
-        },
-    )
+    # Note: max_output_tokens is not supported in subscription mode
+    defaults = {}
+    if not llm.is_subscription:
+        defaults["max_output_tokens"] = llm.max_output_tokens
+    out = apply_defaults_if_absent(user_kwargs, defaults)
 
     # Enforce sampling/tool behavior for Responses path
-    out["temperature"] = 1.0
+    # Note: temperature is not supported in subscription mode
+    if not llm.is_subscription:
+        out["temperature"] = 1.0
     out["tool_choice"] = "auto"
 
     # If user didn't set extra_headers, propagate from llm config
@@ -38,24 +39,30 @@ def select_responses_options(
 
     # Include encrypted reasoning only when the user enables it on the LLM,
     # and only for stateless calls (store=False). Respect user choice.
-    include_list = list(include) if include is not None else []
+    # Note: include and reasoning are not supported in subscription mode
+    # (the Codex subscription endpoint silently returns empty output when
+    # these parameters are present).
+    if not llm.is_subscription:
+        include_list = list(include) if include is not None else []
 
-    if not out.get("store", False) and llm.enable_encrypted_reasoning:
-        if "reasoning.encrypted_content" not in include_list:
-            include_list.append("reasoning.encrypted_content")
-    if include_list:
-        out["include"] = include_list
+        if not out.get("store", False) and llm.enable_encrypted_reasoning:
+            if "reasoning.encrypted_content" not in include_list:
+                include_list.append("reasoning.encrypted_content")
+        if include_list:
+            out["include"] = include_list
 
-    # Include reasoning effort only if explicitly set
-    if llm.reasoning_effort:
-        out["reasoning"] = {"effort": llm.reasoning_effort}
-        # Optionally include summary if explicitly set (requires verified org)
-        if llm.reasoning_summary:
-            out["reasoning"]["summary"] = llm.reasoning_summary
+        # Include reasoning effort only if explicitly set
+        if llm.reasoning_effort:
+            out["reasoning"] = {"effort": llm.reasoning_effort}
+            # Optionally include summary if explicitly set (requires verified org)
+            if llm.reasoning_summary:
+                out["reasoning"]["summary"] = llm.reasoning_summary
 
     # Send prompt_cache_retention only if model supports it
+    # Note: prompt_cache_retention is not supported in subscription mode
     if (
-        get_features(llm.model).supports_prompt_cache_retention
+        not llm.is_subscription
+        and get_features(llm.model).supports_prompt_cache_retention
         and llm.prompt_cache_retention
     ):
         out["prompt_cache_retention"] = llm.prompt_cache_retention

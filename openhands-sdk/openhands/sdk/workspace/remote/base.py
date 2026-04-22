@@ -50,12 +50,17 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
         if client is None:
             # Configure reasonable timeouts for HTTP requests
             # - connect: 10 seconds to establish connection
-            # - read: 60 seconds to read response (for LLM operations)
+            # - read: 600 seconds (10 minutes) to read response (for LLM operations)
             # - write: 10 seconds to send request
             # - pool: 10 seconds to get connection from pool
-            timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+            timeout = httpx.Timeout(
+                connect=10.0, read=self.read_timeout, write=10.0, pool=10.0
+            )
             client = httpx.Client(
-                base_url=self.host, timeout=timeout, headers=self._headers
+                base_url=self.host,
+                timeout=timeout,
+                headers=self._headers,
+                limits=httpx.Limits(max_connections=self.max_connections),
             )
             self._client = client
         return client
@@ -68,6 +73,21 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
                 kwargs = generator.send(response)
         except StopIteration as e:
             return e.value
+
+    def get_server_info(self) -> dict[str, Any]:
+        """Return server metadata from the agent-server.
+
+        This is useful for debugging version mismatches between the local SDK and
+        the remote agent-server image.
+
+        Returns:
+            A JSON-serializable dict returned by GET /server_info.
+        """
+        response = self.client.get("/server_info")
+        response.raise_for_status()
+        data = response.json()
+        assert isinstance(data, dict)
+        return data
 
     def execute_command(
         self,
@@ -178,3 +198,15 @@ class RemoteWorkspace(RemoteWorkspaceMixin, BaseWorkspace):
                 return 200 <= status < 300
         except Exception:
             return False
+
+    @property
+    def default_conversation_tags(self) -> dict[str, str] | None:
+        """Default tags to apply to conversations created with this workspace.
+
+        Subclasses (e.g., OpenHandsCloudWorkspace) can override this to provide
+        context-specific tags like automation metadata.
+
+        Returns:
+            Dictionary of tag key-value pairs, or None if no default tags.
+        """
+        return None

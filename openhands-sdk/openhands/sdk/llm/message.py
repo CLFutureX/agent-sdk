@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from openhands.sdk.logger import get_logger
 from openhands.sdk.utils import DEFAULT_TEXT_CONTENT_LIMIT, maybe_truncate
-from openhands.sdk.utils.deprecation import warn_deprecated
+from openhands.sdk.utils.deprecation import handle_deprecated_model_fields
 
 
 logger = get_logger(__name__)
@@ -170,21 +170,23 @@ class TextContent(BaseContent):
     model_config: ClassVar[ConfigDict] = ConfigDict(
         extra="forbid", populate_by_name=True
     )
-    enable_truncation: bool = True
+
+    # Deprecated fields that are silently removed for backward compatibility when
+    # loading old events. These are kept permanently to ensure old conversations
+    # can always be loaded.
+    _DEPRECATED_FIELDS: ClassVar[tuple[str, ...]] = ("enable_truncation",)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_fields(cls, data: Any) -> Any:
+        """Remove deprecated fields for backward compatibility with old events."""
+        return handle_deprecated_model_fields(data, cls._DEPRECATED_FIELDS)
 
     def to_llm_dict(self) -> list[dict[str, str | dict[str, str]]]:
         """Convert to LLM API format."""
-        text = self.text
-        if self.enable_truncation and len(text) > DEFAULT_TEXT_CONTENT_LIMIT:
-            logger.warning(
-                f"TextContent text length ({len(text)}) exceeds limit "
-                f"({DEFAULT_TEXT_CONTENT_LIMIT}), truncating"
-            )
-            text = maybe_truncate(text, DEFAULT_TEXT_CONTENT_LIMIT)
-
         data: dict[str, str | dict[str, str]] = {
             "type": self.type,
-            "text": text,
+            "text": self.text,
         }
         if self.cache_prompt:
             data["cache_control"] = {"type": "ephemeral"}
@@ -232,8 +234,8 @@ class Message(BaseModel):
     )
 
     # Deprecated fields that were moved to to_chat_dict() parameters.
-    # These fields are ignored but accepted for backward compatibility.
-    # REMOVE_AT: 1.12.0 - Remove this list and the _handle_deprecated_fields validator
+    # These are silently removed for backward compatibility when loading old events.
+    # Kept permanently to ensure old conversations can always be loaded.
     _DEPRECATED_FIELDS: ClassVar[tuple[str, ...]] = (
         "cache_enabled",
         "vision_enabled",
@@ -247,30 +249,8 @@ class Message(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_fields(cls, data: Any) -> Any:
-        """Handle deprecated fields by emitting warnings and removing them.
-
-        REMOVE_AT: 1.12.0 - Remove this validator along with _DEPRECATED_FIELDS
-        """
-        if not isinstance(data, dict):
-            return data
-
-        deprecated_found = [f for f in cls._DEPRECATED_FIELDS if f in data]
-        for field in deprecated_found:
-            warn_deprecated(
-                f"Message.{field}",
-                deprecated_in="1.9.1",
-                removed_in="1.12.0",
-                details=(
-                    f"The '{field}' field has been removed from Message. "
-                    "Pass it as a parameter to to_chat_dict() instead, or use "
-                    "LLM.format_messages_for_llm() which handles this automatically."
-                ),
-                stacklevel=4,  # Adjust for validator call depth
-            )
-            # Remove the deprecated field so Pydantic doesn't complain
-            del data[field]
-
-        return data
+        """Remove deprecated fields for backward compatibility with old events."""
+        return handle_deprecated_model_fields(data, cls._DEPRECATED_FIELDS)
 
     @property
     def contains_image(self) -> bool:
@@ -342,6 +322,8 @@ class Message(BaseModel):
         content = "\n".join(
             item.text for item in self.content if isinstance(item, TextContent)
         )
+        if self.role == "tool":
+            content = self._maybe_truncate_tool_text(content)
         message_dict: dict[str, Any] = {"content": content, "role": self.role}
 
         # tool call keys are added in to_chat_dict to centralize behavior
@@ -365,6 +347,12 @@ class Message(BaseModel):
         for item in self.content:
             # All content types now return list[dict[str, Any]]
             item_dicts = item.to_llm_dict()
+
+            if self.role == "tool" and item_dicts:
+                for d in item_dicts:
+                    text_val = d.get("text")
+                    if d.get("type") == "text" and isinstance(text_val, str):
+                        d["text"] = self._maybe_truncate_tool_text(text_val)
 
             # We have to remove cache_prompt for tool content and move it up to the
             # message level
@@ -551,16 +539,42 @@ class Message(BaseModel):
                 )
                 for c in self.content:
                     if isinstance(c, TextContent):
+                        output_text = self._maybe_truncate_tool_text(c.text)
                         items.append(
                             {
                                 "type": "function_call_output",
                                 "call_id": resp_call_id,
-                                "output": c.text,
+                                "output": output_text,
                             }
                         )
+                    elif isinstance(c, ImageContent) and vision_enabled:
+                        for url in c.image_urls:
+                            items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": resp_call_id,
+                                    "output": [
+                                        {
+                                            "type": "input_image",
+                                            "image_url": url,
+                                            "detail": "auto",
+                                        }
+                                    ],
+                                }
+                            )
             return items
 
         return items
+
+    def _maybe_truncate_tool_text(self, text: str) -> str:
+        if not text or len(text) <= DEFAULT_TEXT_CONTENT_LIMIT:
+            return text
+        logger.warning(
+            "Tool TextContent text length (%s) exceeds limit (%s), truncating",
+            len(text),
+            DEFAULT_TEXT_CONTENT_LIMIT,
+        )
+        return maybe_truncate(text, DEFAULT_TEXT_CONTENT_LIMIT)
 
     @classmethod
     def from_llm_chat_message(cls, message: LiteLLMMessage) -> "Message":
@@ -636,40 +650,64 @@ class Message(BaseModel):
         tool_calls: list[MessageToolCall] = []
         responses_reasoning_item: ReasoningItemModel | None = None
 
+        # Helper to access fields from typed Pydantic objects, generic
+        # litellm base objects (BaseLiteLLMOpenAIResponseObject), or dicts.
+        def _get(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
         for item in output or []:
+            item_type = _get(item, "type")
+
             if (
-                isinstance(item, GenericResponseOutputItem)
-                or isinstance(item, ResponseOutputMessage)
-            ) and item.type == "message":
-                for part in item.content or []:
-                    if part.type == "output_text" and part.text:
-                        assistant_text_parts.append(part.text)
+                isinstance(item, (GenericResponseOutputItem, ResponseOutputMessage))
+                or item_type == "message"
+            ) and item_type == "message":
+                content = _get(item, "content")
+                for part in content or []:
+                    part_type = _get(part, "type")
+                    part_text = _get(part, "text")
+                    if part_type == "output_text" and part_text:
+                        assistant_text_parts.append(part_text)
             elif (
                 isinstance(item, (OutputFunctionToolCall, ResponseFunctionToolCall))
-                and item.type == "function_call"
+                and item_type == "function_call"
             ):
                 tc = MessageToolCall.from_responses_function_call(item)
                 tool_calls.append(tc)
-            elif isinstance(item, ResponseReasoningItem) and item.type == "reasoning":
-                # Parse OpenAI typed Responses "reasoning" output item
-                # (Pydantic BaseModel)
-                rid = item.id
-                summaries = item.summary or []
-                contents = item.content or []
-                enc = item.encrypted_content
-                status = item.status
-
-                summary_list: list[str] = [s.text for s in summaries]
-                content_texts: list[str] = [c.text for c in contents]
-                content_list: list[str] | None = content_texts or None
-
-                responses_reasoning_item = ReasoningItemModel(
-                    id=rid,
-                    summary=summary_list,
-                    content=content_list,
-                    encrypted_content=enc,
-                    status=status,
+            elif item_type == "function_call":
+                # Handle generic objects (e.g., BaseLiteLLMOpenAIResponseObject
+                # from streaming) or dicts with function_call type
+                tc = MessageToolCall(
+                    id=_get(item, "call_id") or _get(item, "id", ""),
+                    name=_get(item, "name", ""),
+                    arguments=_get(item, "arguments", ""),
+                    origin="responses",
                 )
+                tool_calls.append(tc)
+            elif item_type == "reasoning":
+                if isinstance(item, ResponseReasoningItem):
+                    # Typed path: preserves type narrowing for standard API
+                    responses_reasoning_item = ReasoningItemModel(
+                        id=item.id,
+                        summary=[s.text for s in (item.summary or [])],
+                        content=[c.text for c in (item.content or [])] or None,
+                        encrypted_content=item.encrypted_content,
+                        status=item.status,
+                    )
+                else:
+                    # Generic fallback for BaseLiteLLMOpenAIResponseObject
+                    # or dicts (e.g., streaming items from Codex subscription)
+                    summaries = _get(item, "summary") or []
+                    contents = _get(item, "content") or []
+                    responses_reasoning_item = ReasoningItemModel(
+                        id=_get(item, "id"),
+                        summary=[_get(s, "text", "") for s in summaries],
+                        content=[_get(c, "text", "") for c in contents] or None,
+                        encrypted_content=_get(item, "encrypted_content"),
+                        status=_get(item, "status"),
+                    )
 
         assistant_text = "\n".join(assistant_text_parts).strip()
         return Message(
